@@ -1,73 +1,44 @@
-# React + TypeScript + Vite
+# Candidate requirement agent
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React frontend + FastAPI backend with a LangGraph agent that evaluates candidates against requirements (yes/no + reason per requirement). **Evaluate**: upload one or more resumes; name/email are extracted from each. **Ranking**: candidates by total score (configurable weight per requirement). **Admin**: add/edit/delete requirements and set weights.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **Frontend**: React (Vite), shadcn/ui (dark), React Router.
+- **Backend**: FastAPI in `api/`, LangGraph agent with one node per requirement, Gemini (`gemini-flash-latest`).
+- **Resume parsing**: `pdfplumber` (PDF) and `python-docx` (DOCX); name/email extracted from text via LLM.
+- **DB**: Supabase (candidates, evaluations, requirements). Run `supabase_schema.sql` in the SQL Editor (creates tables and seeds default requirements). If the table already exists, run: `alter table public.candidates add column if not exists resume_url text;`
+- **Storage**: Create a Supabase Storage bucket named **resume** (Dashboard → Storage). Set it to **public** if you want direct “View resume” links. Resumes are uploaded there after evaluation.
 
-## React Compiler
+## Env
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Copy `.env.example` to `.env` and set:
 
-## Expanding the ESLint configuration
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY` – for Gemini.
+- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`) – for saving/ranking.
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Run locally
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+1. **Backend** (from repo root):
+   ```bash
+   npm run api
+   ```
+   Serves FastAPI at http://127.0.0.1:8000.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+2. **Frontend** (another terminal):
+   ```bash
+   npm install
+   npm run dev
+   ```
+   Vite proxies `/api` to the backend.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+3. Open the app: **Evaluate** (upload one or more resumes), **Ranking** (click a row to see verdicts; click a verdict to see reason), **Admin** (manage requirements and weights).
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Deploy (Vercel)
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+- Frontend: build from root; output is `dist`.
+- API: `api/index.py` exposes the FastAPI app. The repo includes a rewrite so `/api/*` goes to the API. Ensure env vars are set in the Vercel project for the API (Python runtime).
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## Requirements (nodes)
+
+Requirements are stored in Supabase (`requirements` table). Defaults are seeded by `supabase_schema.sql`. Use **Admin** to add, edit, delete, and set weights. Each requirement is one LangGraph node; Gemini returns **Yes/No** and a short **reason**.
