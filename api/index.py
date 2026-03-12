@@ -3,13 +3,19 @@ FastAPI app wrapping the LangGraph agent and candidate/ranking APIs.
 Vercel: expose this as the serverless entrypoint (e.g. api/index.py -> /api).
 """
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+# Ensure api/ is on path when run from project root (e.g. Vercel serverless)
+_api_dir = Path(__file__).resolve().parent
+if str(_api_dir) not in sys.path:
+    sys.path.insert(0, str(_api_dir))
 
 from dotenv import load_dotenv
 
 # Load .env from project root (parent of api/) when running from api/
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(_api_dir.parent / ".env")
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
