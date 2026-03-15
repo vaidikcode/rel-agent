@@ -1,7 +1,6 @@
 """
-LangGraph agent: one node per requirement.
-Each node uses Gemini to evaluate the candidate (resume text) against that requirement and returns pass/fail + reason.
-Requirements are loaded from DB (Supabase) when available, else from requirements_spec.
+LangGraph evaluation agent.
+Evaluates a candidate against bucket requirements using scraped link content.
 """
 import os
 from typing import Any, TypedDict
@@ -9,9 +8,7 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
-from requirements_spec import REQUIREMENTS as FALLBACK_REQUIREMENTS
 
-# Use exactly this model name as requested
 GEMINI_MODEL = "gemini-flash-latest"
 
 
@@ -21,7 +18,8 @@ class RequirementVerdict(TypedDict):
 
 
 class AgentState(TypedDict):
-    resume_text: str
+    candidate_text: str
+    requirements: list[dict]
     results: dict[str, RequirementVerdict]
 
 
@@ -36,24 +34,7 @@ def _get_llm():
     )
 
 
-def _eval_prompt(requirement_label: str, requirement_prompt: str, resume_text: str) -> str:
-    return f"""You are evaluating a candidate's resume against a specific requirement.
-
-Requirement: {requirement_label}
-What to check: {requirement_prompt}
-
-Resume text (excerpt may be truncated):
----
-{resume_text[:12000]}
----
-
-Respond with exactly two lines:
-1. VERDICT: YES or NO
-2. REASON: one short sentence explaining why."""
-
-
 def _message_content_to_str(content: str | list) -> str:
-    """Normalize LLM message content to string (Gemini may return list of parts)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -63,25 +44,44 @@ def _message_content_to_str(content: str | list) -> str:
     return str(content)
 
 
+def _eval_prompt(requirement_label: str, requirement_prompt: str, candidate_text: str) -> str:
+    return f"""You are evaluating a candidate against a specific requirement.
+
+Requirement: {requirement_label}
+What to check: {requirement_prompt}
+
+Candidate information (scraped from their online profiles):
+---
+{candidate_text[:12000]}
+---
+
+Respond with exactly two lines:
+1. VERDICT: YES or NO
+2. REASON: one short sentence explaining why."""
+
+
 def _parse_verdict(response_text: str) -> RequirementVerdict:
     if not isinstance(response_text, str):
         response_text = _message_content_to_str(response_text)
     passed = False
     reason = response_text.strip()
     for line in response_text.strip().split("\n"):
-        line = line.strip().upper()
-        if line.startswith("VERDICT:"):
-            passed = "YES" in line
-        elif line.startswith("REASON:"):
-            reason = line.replace("REASON:", "").strip()
+        upper = line.strip().upper()
+        if upper.startswith("VERDICT:"):
+            passed = "YES" in upper
+        elif upper.startswith("REASON:"):
+            reason = line.strip()[7:].strip()
     return {"passed": passed, "reason": reason or response_text[:200]}
 
 
 def make_requirement_node(requirement_id: str, label: str, prompt: str):
     def node(state: AgentState) -> dict:
         llm = _get_llm()
-        text = _eval_prompt(label, prompt, state["resume_text"])
-        msg = llm.invoke([SystemMessage(content="You are a strict but fair resume evaluator. Answer only with VERDICT and REASON."), HumanMessage(content=text)])
+        text = _eval_prompt(label, prompt, state["candidate_text"])
+        msg = llm.invoke([
+            SystemMessage(content="You are a strict but fair candidate evaluator. Answer only with VERDICT and REASON."),
+            HumanMessage(content=text),
+        ])
         content = msg.content if hasattr(msg, "content") else str(msg)
         verdict = _parse_verdict(_message_content_to_str(content))
         new_results = dict(state["results"])
@@ -90,33 +90,24 @@ def make_requirement_node(requirement_id: str, label: str, prompt: str):
     return node
 
 
-def _get_requirements() -> list[dict[str, Any]]:
-    try:
-        from supabase_client import get_requirements as db_requirements
-        return db_requirements()
-    except Exception:
-        return FALLBACK_REQUIREMENTS
-
-
-def build_graph(requirements: list[dict[str, Any]] | None = None) -> StateGraph:
-    reqs = requirements if requirements is not None else _get_requirements()
-    if not reqs:
-        reqs = FALLBACK_REQUIREMENTS
+def build_graph(requirements: list[dict[str, Any]]) -> Any:
+    if not requirements:
+        raise ValueError("At least one requirement is needed for evaluation")
     workflow = StateGraph(AgentState)
-    for r in reqs:
+    for r in requirements:
         rid = r["id"]
-        label = r["label"]
-        prompt = r.get("prompt", "")
-        workflow.add_node(rid, make_requirement_node(rid, label, prompt))
-    workflow.add_edge(START, reqs[0]["id"])
-    for i in range(len(reqs) - 1):
-        workflow.add_edge(reqs[i]["id"], reqs[i + 1]["id"])
-    workflow.add_edge(reqs[-1]["id"], END)
+        workflow.add_node(rid, make_requirement_node(rid, r["label"], r.get("prompt", "")))
+    workflow.add_edge(START, requirements[0]["id"])
+    for i in range(len(requirements) - 1):
+        workflow.add_edge(requirements[i]["id"], requirements[i + 1]["id"])
+    workflow.add_edge(requirements[-1]["id"], END)
     return workflow.compile()
 
 
-def run_evaluation(resume_text: str, requirements: list[dict[str, Any]] | None = None) -> dict[str, RequirementVerdict]:
+def run_candidate_evaluation(candidate_text: str, requirements: list[dict[str, Any]]) -> dict[str, RequirementVerdict]:
+    """Evaluate a candidate's scraped content against a list of requirements.
+    Returns { requirement_id: { passed, reason } }."""
     graph = build_graph(requirements)
-    initial: AgentState = {"resume_text": resume_text, "results": {}}
+    initial: AgentState = {"candidate_text": candidate_text, "requirements": requirements, "results": {}}
     final = graph.invoke(initial)
     return final["results"]

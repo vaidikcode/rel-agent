@@ -1,68 +1,36 @@
 """
-FastAPI app wrapping the LangGraph agent and candidate/ranking APIs.
-Vercel: expose this as the serverless entrypoint (e.g. api/index.py -> /api).
+FastAPI app – Job Bucket model.
+Vercel serverless entrypoint: api/index.py -> /api
 """
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
-# Ensure api/ is on path when run from project root (e.g. Vercel serverless)
 _api_dir = Path(__file__).resolve().parent
 if str(_api_dir) not in sys.path:
     sys.path.insert(0, str(_api_dir))
 
 from dotenv import load_dotenv
-
-# Load .env from project root (parent of api/) when running from api/
 load_dotenv(_api_dir.parent / ".env")
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import run_evaluation
-from extract_candidate import extract_candidate_details
-from resume_parser import extract_resume_text
+from agent import run_candidate_evaluation
+from discovery_agent import run_discovery
+from link_scraper import scrape_candidate_links
 from supabase_client import (
-    get_supabase,
-    get_requirements,
-    get_candidate_evaluations,
-    insert_candidate,
-    insert_evaluations,
-    upload_resume,
-    update_candidate_resume_url,
-    get_candidates_with_scores,
-    get_candidates_list,
-    update_candidate,
-    delete_candidate,
-    create_requirement,
-    update_requirement,
-    delete_requirement,
+    list_buckets, get_bucket, create_bucket, update_bucket, delete_bucket,
+    list_bucket_requirements, create_bucket_requirement, update_bucket_requirement, delete_bucket_requirement,
+    list_bucket_candidates, get_bucket_candidate, insert_bucket_candidate, delete_bucket_candidate,
+    list_candidate_links,
+    insert_candidate_evaluations, update_candidate_evaluation_status, get_candidate_evaluations,
 )
 
-app = FastAPI(title="Candidate Requirement Agent API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/")
-@app.get("/api")
-def root() -> dict[str, str]:
-    return {"status": "ok", "service": "candidate-requirement-agent"}
-
-
-def _get_requirements_fallback() -> list[dict[str, Any]]:
-    try:
-        return get_requirements()
-    except Exception:
-        from requirements_spec import REQUIREMENTS as R
-        return [{"id": r["id"], "label": r["label"], "prompt": r["prompt"], "weight": 1, "sort_order": i} for i, r in enumerate(R)]
+app = FastAPI(title="Mirelo AI – Job Bucket API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 def _is_quota_error(e: BaseException) -> bool:
@@ -70,182 +38,225 @@ def _is_quota_error(e: BaseException) -> bool:
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "QUOTA" in msg or "RATE" in msg
 
 
-@app.post("/api/evaluate")
-async def evaluate(
-    file: UploadFile = File(...),
-    save_to_db: bool = Form(True),
-) -> dict[str, Any]:
-    """Extract text from resume, extract name/email from content, run LangGraph agent, return verdict per requirement."""
-    if not file.filename:
-        raise HTTPException(400, "No file uploaded")
-    content = await file.read()
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+@app.get("/api")
+def root():
+    return {"status": "ok", "service": "mirelo-job-bucket-api"}
+
+
+# ---------------------------------------------------------------------------
+# Buckets
+# ---------------------------------------------------------------------------
+
+class BucketCreate(BaseModel):
+    title: str
+    job_description: str = ""
+    requirements: list[dict] | None = None
+
+class BucketUpdate(BaseModel):
+    title: str | None = None
+    job_description: str | None = None
+
+
+@app.get("/api/buckets")
+def api_list_buckets() -> list[dict[str, Any]]:
+    return list_buckets()
+
+@app.post("/api/buckets")
+def api_create_bucket(body: BucketCreate) -> dict[str, Any]:
+    if not body.title.strip():
+        raise HTTPException(400, "Title is required")
+    return create_bucket(body.title.strip(), body.job_description.strip(), body.requirements)
+
+@app.get("/api/buckets/{bucket_id}")
+def api_get_bucket(bucket_id: str) -> dict[str, Any]:
     try:
-        resume_text = extract_resume_text(content, file.filename)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    if not resume_text or len(resume_text.strip()) < 50:
-        raise HTTPException(400, "Could not extract enough text from the resume. Use a PDF or DOCX with selectable text.")
+        return get_bucket(bucket_id)
+    except Exception:
+        raise HTTPException(404, "Bucket not found")
 
-    reqs = _get_requirements_fallback()
-    weight_by_id = {r["id"]: r.get("weight", 1) for r in reqs}
-
+@app.patch("/api/buckets/{bucket_id}")
+def api_update_bucket(bucket_id: str, body: BucketUpdate) -> dict[str, Any]:
     try:
-        details = extract_candidate_details(resume_text)
-    except Exception as e:
-        if _is_quota_error(e):
-            raise HTTPException(
-                429,
-                "API quota or rate limit reached. Please wait a minute and try again, or check your Gemini API plan and billing.",
-            ) from e
-        raise
+        return update_bucket(bucket_id, title=body.title, job_description=body.job_description)
+    except Exception:
+        raise HTTPException(404, "Bucket not found")
 
-    name = (details.get("name") or "Unknown").strip()
-    email = (details.get("email") or "").strip()
-
-    try:
-        results = run_evaluation(resume_text, reqs)
-    except Exception as e:
-        if _is_quota_error(e):
-            raise HTTPException(
-                429,
-                "API quota or rate limit reached. Please wait a minute and try again, or check your Gemini API plan and billing.",
-            ) from e
-        raise
-
-    score = sum(weight_by_id.get(rid, 1) for rid, v in results.items() if v.get("passed"))
-    max_score = sum(weight_by_id.get(r["id"], 1) for r in reqs)
-    relevance_percentage = round((score / max_score) * 100) if max_score else 0
-
-    out = {
-        "name": name,
-        "email": email,
-        "results": results,
-        "score": score,
-        "max_score": max_score,
-        "relevance_percentage": relevance_percentage,
-    }
-
-    if save_to_db and os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
-        try:
-            row = insert_candidate(name, email, resume_text)
-            insert_evaluations(row["id"], results)
-            out["candidate_id"] = row["id"]
-            try:
-                url = upload_resume(row["id"], file.filename or "resume.pdf", content)
-                update_candidate_resume_url(row["id"], url)
-            except Exception as e:
-                out["save_error"] = str(e)
-        except Exception as e:
-            out["save_error"] = str(e)
-
-    return out
+@app.delete("/api/buckets/{bucket_id}")
+def api_delete_bucket(bucket_id: str):
+    delete_bucket(bucket_id)
+    return {"ok": True}
 
 
-@app.get("/api/requirements")
-def list_requirements() -> list[dict[str, Any]]:
-    """Return requirement id, label, prompt, weight for UI."""
-    reqs = _get_requirements_fallback()
-    return [{"id": r["id"], "label": r["label"], "prompt": r.get("prompt", ""), "weight": r.get("weight", 1), "sort_order": r.get("sort_order", 0)} for r in reqs]
+# ---------------------------------------------------------------------------
+# Bucket Requirements
+# ---------------------------------------------------------------------------
 
-
-@app.get("/api/candidates/{candidate_id}/evaluations")
-def candidate_evaluations(candidate_id: str) -> list[dict[str, Any]]:
-    """Return requirement verdicts (with reason) for a candidate."""
-    try:
-        return get_candidate_evaluations(candidate_id)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-class RequirementCreate(BaseModel):
-    id: str
+class ReqCreate(BaseModel):
     label: str
     prompt: str
     weight: int = 1
 
-
-class RequirementUpdate(BaseModel):
+class ReqUpdate(BaseModel):
     label: str | None = None
     prompt: str | None = None
     weight: int | None = None
 
 
-@app.post("/api/requirements")
-def add_requirement(body: RequirementCreate) -> dict[str, Any]:
-    """Add a requirement."""
-    id_ = body.id.strip().lower().replace(" ", "_")
-    if not id_ or not body.label or not body.prompt:
-        raise HTTPException(400, "id, label, and prompt required")
+@app.get("/api/buckets/{bucket_id}/requirements")
+def api_list_requirements(bucket_id: str) -> list[dict[str, Any]]:
+    return list_bucket_requirements(bucket_id)
+
+@app.post("/api/buckets/{bucket_id}/requirements")
+def api_create_requirement(bucket_id: str, body: ReqCreate) -> dict[str, Any]:
+    if not body.label.strip() or not body.prompt.strip():
+        raise HTTPException(400, "label and prompt are required")
+    return create_bucket_requirement(bucket_id, body.label.strip(), body.prompt.strip(), body.weight)
+
+@app.patch("/api/buckets/{bucket_id}/requirements/{req_id}")
+def api_update_requirement(bucket_id: str, req_id: str, body: ReqUpdate) -> dict[str, Any]:
     try:
-        return create_requirement(id_, body.label, body.prompt, body.weight)
+        return update_bucket_requirement(req_id, label=body.label, prompt=body.prompt, weight=body.weight)
     except Exception as e:
         raise HTTPException(400, str(e))
 
+@app.delete("/api/buckets/{bucket_id}/requirements/{req_id}")
+def api_delete_requirement(bucket_id: str, req_id: str):
+    delete_bucket_requirement(req_id)
+    return {"ok": True}
 
-@app.patch("/api/requirements/{requirement_id}")
-def patch_requirement(requirement_id: str, body: RequirementUpdate) -> dict[str, Any]:
-    """Update a requirement. Body: { label?, prompt?, weight? }."""
+
+# ---------------------------------------------------------------------------
+# Bucket Candidates
+# ---------------------------------------------------------------------------
+
+@app.get("/api/buckets/{bucket_id}/candidates")
+def api_list_candidates(bucket_id: str) -> list[dict[str, Any]]:
+    return list_bucket_candidates(bucket_id)
+
+@app.get("/api/buckets/{bucket_id}/candidates/{candidate_id}")
+def api_get_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
     try:
-        return update_requirement(
-            requirement_id,
-            label=body.label,
-            prompt=body.prompt,
-            weight=body.weight,
-        )
-    except RuntimeError:
-        raise HTTPException(404, "Requirement not found")
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-
-@app.delete("/api/requirements/{requirement_id}")
-def remove_requirement(requirement_id: str) -> None:
-    try:
-        delete_requirement(requirement_id)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.get("/api/ranking")
-def ranking() -> list[dict[str, Any]]:
-    """Return candidates with total score, sorted by score descending."""
-    try:
-        return get_candidates_with_scores()
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.get("/api/candidates")
-def list_candidates() -> list[dict[str, Any]]:
-    """List all candidates (admin)."""
-    try:
-        return get_candidates_list()
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-class CandidateUpdate(BaseModel):
-    name: str | None = None
-    email: str | None = None
-
-
-@app.patch("/api/candidates/{candidate_id}")
-def patch_candidate(candidate_id: str, body: CandidateUpdate) -> dict[str, Any]:
-    """Update candidate name/email (admin)."""
-    try:
-        return update_candidate(candidate_id, name=body.name, email=body.email)
-    except RuntimeError:
+        return get_bucket_candidate(candidate_id)
+    except Exception:
         raise HTTPException(404, "Candidate not found")
-    except ValueError:
-        raise HTTPException(400, "Provide name and/or email")
-    except Exception as e:
-        raise HTTPException(400, str(e))
+
+@app.delete("/api/buckets/{bucket_id}/candidates/{candidate_id}")
+def api_delete_candidate(bucket_id: str, candidate_id: str):
+    delete_bucket_candidate(candidate_id)
+    return {"ok": True}
 
 
-@app.delete("/api/candidates/{candidate_id}")
-def remove_candidate(candidate_id: str) -> None:
-    """Delete candidate and related evaluations (admin)."""
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+@app.post("/api/buckets/{bucket_id}/discover")
+def api_discover(bucket_id: str) -> list[dict[str, Any]]:
+    """Run web discovery for a bucket and save candidates to DB."""
     try:
-        delete_candidate(candidate_id)
+        bucket = get_bucket(bucket_id)
+    except Exception:
+        raise HTTPException(404, "Bucket not found")
+
+    if not bucket.get("job_description", "").strip():
+        raise HTTPException(400, "Bucket has no job description")
+    if not os.environ.get("SERPER_API_KEY"):
+        raise HTTPException(400, "SERPER_API_KEY not configured")
+
+    requirements = bucket.get("requirements", [])
+
+    try:
+        discovered = run_discovery(bucket["job_description"], requirements)
     except Exception as e:
-        raise HTTPException(500, str(e))
+        if _is_quota_error(e):
+            raise HTTPException(429, "API quota / rate limit reached. Wait a minute and retry.")
+        raise HTTPException(500, f"Discovery failed: {e}")
+
+    saved: list[dict[str, Any]] = []
+    for c in discovered:
+        try:
+            row = insert_bucket_candidate(
+                bucket_id=bucket_id,
+                name=c.get("name", "Unknown"),
+                headline=c.get("headline", ""),
+                location=c.get("location", "Unknown"),
+                summary=c.get("summary", ""),
+                skills=c.get("skills", []),
+                links=c.get("links", []),
+            )
+            saved.append(row)
+        except Exception as e:
+            print(f"[discover] Failed to save candidate: {e}", flush=True)
+
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+@app.post("/api/buckets/{bucket_id}/candidates/{candidate_id}/evaluate")
+def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
+    """Scrape candidate links, evaluate against bucket requirements, save results."""
+    try:
+        bucket = get_bucket(bucket_id)
+    except Exception:
+        raise HTTPException(404, "Bucket not found")
+
+    try:
+        candidate = get_bucket_candidate(candidate_id)
+    except Exception:
+        raise HTTPException(404, "Candidate not found")
+
+    requirements = bucket.get("requirements", [])
+    if not requirements:
+        raise HTTPException(400, "Bucket has no requirements to evaluate against")
+
+    links = candidate.get("links") or list_candidate_links(candidate_id)
+    candidate_info = (
+        f"Name: {candidate.get('name', '')}\n"
+        f"Headline: {candidate.get('headline', '')}\n"
+        f"Location: {candidate.get('location', '')}\n"
+        f"Skills: {candidate.get('skills', [])}\n"
+        f"Summary: {candidate.get('summary', '')}\n"
+    )
+
+    scraped_text = ""
+    if links:
+        try:
+            scraped_text = scrape_candidate_links(links, max_links=5)
+        except Exception as e:
+            scraped_text = f"[Scraping failed: {e}]"
+
+    full_text = candidate_info + "\n\nScraped profile content:\n" + scraped_text if scraped_text else candidate_info
+
+    try:
+        verdicts = run_candidate_evaluation(full_text, requirements)
+    except Exception as e:
+        if _is_quota_error(e):
+            raise HTTPException(429, "API quota / rate limit reached. Wait a minute and retry.")
+        raise HTTPException(500, f"Evaluation failed: {e}")
+
+    eval_rows = []
+    for req in requirements:
+        rid = req["id"]
+        v = verdicts.get(rid, {"passed": False, "reason": "Not evaluated"})
+        eval_rows.append({"requirement_id": rid, "passed": v["passed"], "reason": v.get("reason", "")})
+
+    insert_candidate_evaluations(candidate_id, eval_rows)
+
+    total_weight = sum(r.get("weight", 1) for r in requirements) or 1
+    earned = sum(r.get("weight", 1) for r in requirements if verdicts.get(r["id"], {}).get("passed"))
+    relevance = round((earned / total_weight) * 100)
+    update_candidate_evaluation_status(candidate_id, relevance)
+
+    return {
+        "candidate_id": candidate_id,
+        "relevance_percentage": relevance,
+        "evaluations": eval_rows,
+    }

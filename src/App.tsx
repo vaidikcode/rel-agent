@@ -1,7 +1,8 @@
 import { Link, Route, Routes } from "react-router-dom"
-import { EvaluatePage } from "@/pages/EvaluatePage"
-import { RankingPage } from "@/pages/RankingPage"
-import { AdminPage } from "@/pages/AdminPage"
+import { BucketListPage } from "@/pages/BucketListPage"
+import { CreateBucketPage } from "@/pages/CreateBucketPage"
+import { BucketDetailPage } from "@/pages/BucketDetailPage"
+import { CandidateDetailPage } from "@/pages/CandidateDetailPage"
 
 function App() {
   return (
@@ -12,23 +13,18 @@ function App() {
             <img src="/logo-dark.png" alt="Mirelo AI" className="h-8 w-auto" />
           </Link>
           <nav className="flex items-center gap-6">
-            <Link to="/" className="text-primary font-medium hover:underline">
-              Evaluate
-            </Link>
-            <Link to="/ranking" className="text-muted-foreground hover:text-foreground">
-              Ranking
-            </Link>
-            <Link to="/admin" className="text-muted-foreground hover:text-foreground">
-              Admin
+            <Link to="/" className="text-muted-foreground hover:text-foreground font-medium">
+              Buckets
             </Link>
           </nav>
         </div>
       </header>
       <main className="container mx-auto max-w-4xl px-6 py-8">
         <Routes>
-          <Route path="/" element={<EvaluatePage />} />
-          <Route path="/ranking" element={<RankingPage />} />
-          <Route path="/admin" element={<AdminPage />} />
+          <Route path="/" element={<BucketListPage />} />
+          <Route path="/buckets/new" element={<CreateBucketPage />} />
+          <Route path="/buckets/:id" element={<BucketDetailPage />} />
+          <Route path="/buckets/:id/candidates/:candidateId" element={<CandidateDetailPage />} />
         </Routes>
       </main>
     </div>
