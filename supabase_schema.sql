@@ -44,9 +44,22 @@ create table if not exists public.candidate_links (
   url text not null,
   label text not null default '',
   source text not null default 'discovery',
+  link_type text not null default 'web',
   created_at timestamptz not null default now()
 );
 create index if not exists candidate_links_candidate on public.candidate_links(candidate_id);
+
+-- 4b. Fetched content for each link (persisted so we don't re-fetch)
+create table if not exists public.candidate_link_fetches (
+  id uuid primary key default gen_random_uuid(),
+  candidate_link_id uuid not null references public.candidate_links(id) on delete cascade,
+  link_type text not null default 'web',
+  content_type text not null default 'text',
+  content_text text not null default '',
+  metadata jsonb not null default '{}',
+  fetched_at timestamptz not null default now()
+);
+create unique index if not exists candidate_link_fetches_link on public.candidate_link_fetches(candidate_link_id);
 
 -- 5. Per-requirement evaluations for a candidate
 create table if not exists public.candidate_evaluations (

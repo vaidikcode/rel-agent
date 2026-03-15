@@ -1,12 +1,13 @@
 """
 Discovery agent: search the web for candidates matching a job description.
-Focus: find people and extract their info + links. No scoring or outreach.
+Focus: find people and extract their info + multiple links. No requirements, no scoring.
 
 Nodes:
-  1. search  – Build queries from job desc + requirements, call Serper
-  2. extract – Use Gemini to pull structured profiles + links from results
+  1. search  – Build queries from job description only, call Serper
+  2. extract – Use Gemini to pull structured profiles + multiple links per candidate
 """
 import json
+import logging
 import os
 from typing import Any, TypedDict
 
@@ -14,6 +15,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from agent import _get_llm, _message_content_to_str
+
+log = logging.getLogger("discovery")
 
 
 class DiscoveredCandidate(TypedDict, total=False):
@@ -27,7 +30,6 @@ class DiscoveredCandidate(TypedDict, total=False):
 
 class DiscoveryState(TypedDict, total=False):
     job_description: str
-    requirements: list[dict]
     search_results: list[dict]
     candidates: list[DiscoveredCandidate]
 
@@ -50,16 +52,12 @@ def _serper_search(query: str, num_results: int = 10) -> list[dict]:
     resp.raise_for_status()
     data = resp.json()
     organic = data.get("organic") or []
-    print(f"[discovery] Serper returned {len(organic)} results", flush=True)
+    log.info("search    Serper returned %d results for query", len(organic))
     return organic
 
 
-def _build_search_queries(job_description: str, requirements: list[dict]) -> list[str]:
+def _build_search_queries(job_description: str) -> list[str]:
     llm = _get_llm()
-    req_text = ""
-    if requirements:
-        req_text = "\nKey requirements:\n" + "\n".join(f"- {r['label']}" for r in requirements[:8])
-
     prompt = f"""You are a technical recruiter. Generate exactly 3 Google search queries to find
 candidate profiles (people, not job listings) matching this role.
 Target professional sites: LinkedIn, GitHub, StackOverflow, personal blogs, portfolios.
@@ -69,7 +67,6 @@ Job description:
 ---
 {job_description[:5000]}
 ---
-{req_text}
 
 Return exactly 3 lines, one query per line, nothing else."""
 
@@ -87,8 +84,10 @@ Return exactly 3 lines, one query per line, nothing else."""
 # ---------------------------------------------------------------------------
 
 def search_node(state: DiscoveryState) -> dict:
-    queries = _build_search_queries(state["job_description"], state.get("requirements", []))
-    print(f"[discovery] Running {len(queries)} search queries", flush=True)
+    queries = _build_search_queries(state["job_description"])
+    log.info("search    generated %d queries", len(queries))
+    for i, q in enumerate(queries, 1):
+        log.info("search    query %d: %s", i, q[:100])
     all_results: list[dict] = []
     seen_urls: set[str] = set()
     for q in queries:
@@ -100,8 +99,8 @@ def search_node(state: DiscoveryState) -> dict:
                     seen_urls.add(url)
                     all_results.append(r)
         except Exception as e:
-            print(f"[discovery] Serper failed: {e}", flush=True)
-    print(f"[discovery] {len(all_results)} unique search results", flush=True)
+            log.error("search    Serper failed for query '%s': %s", q[:60], e)
+    log.info("search    %d unique results from %d queries", len(all_results), len(queries))
     return {"search_results": all_results[:25]}
 
 
@@ -134,7 +133,7 @@ For each result that could represent a real person (developer profile, portfolio
 - location: if mentioned, else "Unknown"
 - skills: array of relevant skills (strings)
 - summary: one sentence on why they might be relevant
-- links: array of objects with "url" and "label" (e.g. {{"url": "https://...", "label": "GitHub Profile"}})
+- links: array of objects with "url" and "label". Include multiple links per candidate when available (e.g. LinkedIn, GitHub, portfolio, blog, Stack Overflow). For each person, add every relevant URL you can identify from the results (same person may appear in multiple results with different links).
 
 Include any result that seems to belong to a real person or their work.
 Return a JSON array of objects. Return ONLY the JSON array, no markdown fences."""
@@ -153,7 +152,7 @@ Return a JSON array of objects. Return ONLY the JSON array, no markdown fences."
         if not isinstance(raw, list):
             raw = []
     except json.JSONDecodeError:
-        print("[discovery] Extract: invalid JSON from LLM, falling back", flush=True)
+        log.warning("extract   invalid JSON from LLM, falling back to empty list")
         raw = []
 
     candidates: list[DiscoveredCandidate] = []
@@ -184,7 +183,7 @@ Return a JSON array of objects. Return ONLY the JSON array, no markdown fences."
         })
 
     if not candidates and results:
-        print("[discovery] Extract: 0 from LLM, building fallback", flush=True)
+        log.warning("extract   LLM returned 0 candidates, building fallback from %d results", len(results))
         for r in results[:15]:
             title = (r.get("title") or "").strip()
             link = (r.get("link") or "").strip()
@@ -199,7 +198,9 @@ Return a JSON array of objects. Return ONLY the JSON array, no markdown fences."
                     "links": [{"url": link, "label": "Source"}] if link else [],
                 })
 
-    print(f"[discovery] Extracted {len(candidates)} candidates", flush=True)
+    log.info("extract   extracted %d candidates", len(candidates))
+    for c in candidates:
+        log.info("extract   candidate: %s (%d links)", c.get("name", "?"), len(c.get("links", [])))
     return {"candidates": candidates}
 
 
@@ -217,12 +218,11 @@ def build_discovery_graph() -> Any:
     return workflow.compile()
 
 
-def run_discovery(job_description: str, requirements: list[dict] | None = None) -> list[DiscoveredCandidate]:
-    """Run search + extract and return discovered candidates with links."""
+def run_discovery(job_description: str) -> list[DiscoveredCandidate]:
+    """Run search + extract and return discovered candidates with links. Does not use bucket requirements."""
     graph = build_discovery_graph()
     initial: DiscoveryState = {
         "job_description": job_description,
-        "requirements": requirements or [],
         "search_results": [],
         "candidates": [],
     }

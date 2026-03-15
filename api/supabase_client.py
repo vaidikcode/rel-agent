@@ -152,19 +152,52 @@ def get_bucket_candidate(candidate_id: str) -> dict[str, Any]:
     if not candidate:
         raise RuntimeError("Candidate not found")
     links = sb.table("candidate_links").select("*").eq("candidate_id", candidate_id).execute()
-    candidate["links"] = list(links.data or [])
+    links_list = list(links.data or [])
+    candidate["links"] = links_list
+
     evals = sb.table("candidate_evaluations").select("*").eq("candidate_id", candidate_id).execute()
     evals_list = list(evals.data or [])
-    # Enrich with requirement labels so UI shows labels instead of UUIDs
     reqs = list_bucket_requirements(candidate["bucket_id"])
     req_labels = {req["id"]: req.get("label", "") for req in reqs}
     for e in evals_list:
         e["requirement_label"] = req_labels.get(e["requirement_id"], e["requirement_id"])
     candidate["evaluations"] = evals_list
+
+    link_ids = [l["id"] for l in links_list]
+    fetches_by_link: dict[str, dict] = {}
+    if link_ids:
+        fetches = sb.table("candidate_link_fetches").select("*").in_("candidate_link_id", link_ids).execute()
+        for f in (fetches.data or []):
+            fetches_by_link[f["candidate_link_id"]] = f
+
+    fetched_details: list[dict[str, Any]] = []
+    for link in links_list:
+        fetch = fetches_by_link.get(link["id"])
+        if fetch:
+            meta = fetch.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            content_text = fetch.get("content_text", "")
+            fetched_details.append({
+                "link_id": link["id"],
+                "url": link["url"],
+                "label": link.get("label", ""),
+                "link_type": fetch.get("link_type", link.get("link_type", "web")),
+                "content_type": fetch.get("content_type", "text"),
+                "content_preview": content_text[:500] if content_text else "",
+                "metadata": meta,
+                "fetched_at": fetch.get("fetched_at"),
+            })
+    candidate["fetched_details"] = fetched_details
+
     return candidate
 
 
 def insert_bucket_candidate(bucket_id: str, name: str, headline: str, location: str, summary: str, skills: list[str], links: list[dict] | None = None) -> dict[str, Any]:
+    from link_classifier import infer_link_type
     sb = get_supabase()
     r = sb.table("bucket_candidates").insert({
         "bucket_id": bucket_id,
@@ -180,12 +213,47 @@ def insert_bucket_candidate(bucket_id: str, name: str, headline: str, location: 
     candidate = r.data[0]
     if links:
         link_rows = [
-            {"candidate_id": candidate["id"], "url": l["url"], "label": l.get("label", ""), "source": l.get("source", "discovery")}
+            {
+                "candidate_id": candidate["id"],
+                "url": l["url"],
+                "label": l.get("label", ""),
+                "source": l.get("source", "discovery"),
+                "link_type": l.get("link_type") or infer_link_type(l["url"]),
+            }
             for l in links if l.get("url")
         ]
         if link_rows:
             sb.table("candidate_links").insert(link_rows).execute()
     return candidate
+
+
+def update_bucket_candidate(
+    candidate_id: str,
+    *,
+    name: str | None = None,
+    headline: str | None = None,
+    location: str | None = None,
+    summary: str | None = None,
+    skills: list[str] | None = None,
+) -> dict[str, Any]:
+    sb = get_supabase()
+    updates: dict[str, Any] = {}
+    if name is not None:
+        updates["name"] = name
+    if headline is not None:
+        updates["headline"] = headline
+    if location is not None:
+        updates["location"] = location
+    if summary is not None:
+        updates["summary"] = summary
+    if skills is not None:
+        updates["skills"] = json.dumps(skills)
+    if not updates:
+        return get_bucket_candidate(candidate_id)
+    r = sb.table("bucket_candidates").update(updates).eq("id", candidate_id).execute()
+    if not r.data:
+        raise RuntimeError("Candidate not found")
+    return r.data[0]
 
 
 def delete_bucket_candidate(candidate_id: str) -> None:
@@ -229,4 +297,49 @@ def update_candidate_evaluation_status(candidate_id: str, relevance_percentage: 
 def get_candidate_evaluations(candidate_id: str) -> list[dict[str, Any]]:
     sb = get_supabase()
     r = sb.table("candidate_evaluations").select("*").eq("candidate_id", candidate_id).execute()
+    return list(r.data or [])
+
+
+# ---------------------------------------------------------------------------
+# Candidate Link Fetches
+# ---------------------------------------------------------------------------
+
+def upsert_link_fetch(
+    candidate_link_id: str,
+    link_type: str,
+    content_type: str,
+    content_text: str,
+    metadata: dict | None = None,
+) -> dict[str, Any]:
+    """Insert or update fetched content for a candidate link (one row per link)."""
+    from datetime import datetime, timezone
+    sb = get_supabase()
+    row = {
+        "candidate_link_id": candidate_link_id,
+        "link_type": link_type,
+        "content_type": content_type,
+        "content_text": content_text,
+        "metadata": json.dumps(metadata or {}),
+        "fetched_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    r = sb.table("candidate_link_fetches").upsert(row, on_conflict="candidate_link_id").execute()
+    return r.data[0] if r.data else row
+
+
+def get_link_fetch(candidate_link_id: str) -> dict[str, Any] | None:
+    sb = get_supabase()
+    r = sb.table("candidate_link_fetches").select("*").eq("candidate_link_id", candidate_link_id).execute()
+    if r.data:
+        return r.data[0]
+    return None
+
+
+def list_link_fetches_for_candidate(candidate_id: str) -> list[dict[str, Any]]:
+    """Get all link fetches for a candidate (join via candidate_links)."""
+    sb = get_supabase()
+    links = sb.table("candidate_links").select("id").eq("candidate_id", candidate_id).execute()
+    link_ids = [l["id"] for l in (links.data or [])]
+    if not link_ids:
+        return []
+    r = sb.table("candidate_link_fetches").select("*").in_("candidate_link_id", link_ids).execute()
     return list(r.data or [])

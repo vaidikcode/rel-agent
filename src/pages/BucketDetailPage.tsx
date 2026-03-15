@@ -9,8 +9,8 @@ import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Loader2, Search, Trash2, Plus, ArrowLeft, ChevronRight, Pencil, Save } from "lucide-react"
-import { cn } from "@/lib/utils"
 
 const API = "/api"
 
@@ -73,17 +73,19 @@ export function BucketDetailPage() {
     }
   }
 
+  async function handleDeleteCandidate(candidateId: string) {
+    if (!confirm("Remove this candidate from the bucket?")) return
+    try {
+      const r = await fetch(`${API}/buckets/${id}/candidates/${candidateId}`, { method: "DELETE" })
+      if (r.ok) await fetchCandidates()
+    } catch {}
+  }
+
   if (loading) {
     return <div className="space-y-4"><Skeleton className="h-10 w-64" /><Skeleton className="h-64 w-full" /></div>
   }
   if (error || !bucket) {
     return <p className="text-destructive">{error || "Bucket not found"}</p>
-  }
-
-  const skills = (c: Candidate) => {
-    if (Array.isArray(c.skills)) return c.skills
-    if (typeof c.skills === "string") { try { return JSON.parse(c.skills) } catch { return [] } }
-    return []
   }
 
   return (
@@ -128,13 +130,16 @@ export function BucketDetailPage() {
         {/* --- Candidates Tab --- */}
         <TabsContent value="candidates" className="mt-4">
           <Card>
-            <CardHeader>
-              <CardTitle>All candidates</CardTitle>
-              <CardDescription>Click a candidate to see details and evaluate them.</CardDescription>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0">
+              <div>
+                <CardTitle>Candidates</CardTitle>
+                <CardDescription>Click a candidate to see details and evaluate.</CardDescription>
+              </div>
+              <AddCandidateDialog bucketId={id!} onAdded={fetchCandidates} />
             </CardHeader>
             <CardContent className="overflow-x-auto">
               {candidates.length === 0 ? (
-                <p className="text-muted-foreground text-sm py-4">No candidates yet. Run discovery first.</p>
+                <p className="text-muted-foreground text-sm py-4">No candidates yet. Add one or run discovery.</p>
               ) : (
                 <Table>
                   <TableHeader>
@@ -144,6 +149,7 @@ export function BucketDetailPage() {
                       <TableHead className="hidden sm:table-cell">Headline</TableHead>
                       <TableHead className="w-28">Status</TableHead>
                       <TableHead className="w-24 text-right">Relevance</TableHead>
+                      <TableHead className="w-10" />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -159,6 +165,11 @@ export function BucketDetailPage() {
                         </TableCell>
                         <TableCell className="text-right">
                           {c.relevance_percentage != null ? <Badge variant="secondary">{c.relevance_percentage}%</Badge> : <span className="text-muted-foreground text-xs">—</span>}
+                        </TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-destructive" onClick={() => handleDeleteCandidate(c.id)}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         </TableCell>
                       </TableRow>
                     ))}
@@ -180,6 +191,70 @@ export function BucketDetailPage() {
   )
 }
 
+
+/* ---------- Add candidate dialog ---------- */
+
+function AddCandidateDialog({ bucketId, onAdded }: { bucketId: string; onAdded: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [name, setName] = useState("")
+  const [headline, setHeadline] = useState("")
+  const [location, setLocation] = useState("")
+  const [summary, setSummary] = useState("")
+  const [skillsStr, setSkillsStr] = useState("")
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setSaving(true)
+    try {
+      const r = await fetch(`${API}/buckets/${bucketId}/candidates`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: name.trim() || "Unnamed",
+          headline: headline.trim(),
+          location: location.trim() || "Unknown",
+          summary: summary.trim(),
+          skills: skillsStr.split(",").map((s) => s.trim()).filter(Boolean),
+        }),
+      })
+      if (!r.ok) throw new Error("Failed to add")
+      setOpen(false)
+      setName("")
+      setHeadline("")
+      setLocation("")
+      setSummary("")
+      setSkillsStr("")
+      onAdded()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger>
+        <Button size="sm"><Plus className="h-3.5 w-3.5 mr-1" />Add candidate</Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add candidate</DialogTitle>
+        </DialogHeader>
+        <form onSubmit={submit} className="space-y-3">
+          <div className="space-y-1"><Label>Name</Label><Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name" /></div>
+          <div className="space-y-1"><Label>Headline</Label><Input value={headline} onChange={(e) => setHeadline(e.target.value)} placeholder="Job title or tagline" /></div>
+          <div className="space-y-1"><Label>Location</Label><Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="City, Country" /></div>
+          <div className="space-y-1"><Label>Summary</Label><Textarea value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Short bio" rows={3} className="resize-y" /></div>
+          <div className="space-y-1"><Label>Skills (comma-separated)</Label><Input value={skillsStr} onChange={(e) => setSkillsStr(e.target.value)} placeholder="React, TypeScript, ..." /></div>
+          <div className="flex gap-2 pt-2">
+            <Button type="submit" disabled={saving}>{saving ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : null}Save</Button>
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 /* ---------- Admin sub-components ---------- */
 
