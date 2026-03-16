@@ -25,8 +25,11 @@ def infer_link_type(url: str) -> str:
         log.debug("classify  url=%s → web (parse error)", url)
         return "web"
 
-    if "github.com" in host or "github.io" in host:
+    # Only github.com users/repos use the API. github.io = personal Pages site → crawl as blog
+    if "github.com" in host:
         result = "github"
+    elif "github.io" in host:
+        result = "blog"
     elif "linkedin.com" in host:
         result = "linkedin"
     elif path.endswith(".pdf") or "arxiv.org" in host or "doi.org" in host or "scholar.google" in host:

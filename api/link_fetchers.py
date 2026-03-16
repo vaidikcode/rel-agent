@@ -14,9 +14,109 @@ import logging
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urldefrag
 
 log = logging.getLogger("pipeline.fetch")
+
+# ---------------------------------------------------------------------------
+# URL extraction helpers
+# ---------------------------------------------------------------------------
+
+_GITHUB_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/([a-zA-Z0-9_.-]+)(?:/([a-zA-Z0-9_.-]+))?(?:/[^\s)\]]*)?",
+    re.IGNORECASE,
+)
+
+_ANY_URL_RE = re.compile(r"https?://[^\s\"'<>\)\]\}]+", re.IGNORECASE)
+
+_ALLOWED_DISCOVERY_HOSTS = {
+    "github.com", "linkedin.com", "arxiv.org", "doi.org",
+    "scholar.google.com", "semanticscholar.org",
+    "medium.com", "dev.to", "substack.com",
+}
+
+_NOISE_PATH_TOKENS = {
+    "login", "logout", "signin", "signup", "share", "intent",
+    "auth", "oauth", "settings", "notifications", "help", "support",
+    "terms", "privacy", "policy", "status", "jobs",
+}
+
+
+def extract_github_urls_from_text(text: str, max_urls: int = 10) -> list[str]:
+    """Extract unique, normalized github.com URLs from page content."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _GITHUB_URL_RE.finditer(text):
+        owner = (m.group(1) or "").strip()
+        repo = (m.group(2) or "").strip()
+        if not owner or owner.lower() in ("settings", "notifications", "orgs", "explore", "topics"):
+            continue
+        if repo and repo.lower() not in ("settings", "notifications"):
+            url = f"https://github.com/{owner}/{repo}"
+        else:
+            url = f"https://github.com/{owner}"
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+            if len(out) >= max_urls:
+                break
+    return out
+
+
+def extract_discoverable_urls(
+    text: str,
+    source_url: str | None = None,
+    max_urls: int = 15,
+) -> list[str]:
+    """Extract URLs worth fetching from page content.
+
+    Keeps: allowed-domain URLs + same-origin URLs (for portfolio subpages).
+    Skips: login/auth noise, fragments, duplicates.
+    """
+    if not text:
+        return []
+
+    source_host: str | None = None
+    if source_url:
+        try:
+            source_host = (urlparse(source_url).hostname or "").lower().removeprefix("www.")
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    for m in _ANY_URL_RE.finditer(text):
+        raw = m.group(0).rstrip(".,;:!?)'\"")
+        defragged, _ = urldefrag(raw)
+        if not defragged or defragged in seen:
+            continue
+
+        try:
+            parsed = urlparse(defragged)
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+            path = parsed.path.lower()
+        except Exception:
+            continue
+
+        path_parts = {p for p in path.split("/") if p}
+        if path_parts & _NOISE_PATH_TOKENS:
+            continue
+
+        is_allowed = any(host.endswith(ah) for ah in _ALLOWED_DISCOVERY_HOSTS)
+        is_same_origin = source_host and host == source_host
+
+        if not is_allowed and not is_same_origin:
+            continue
+
+        seen.add(defragged)
+        out.append(defragged)
+        if len(out) >= max_urls:
+            break
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +155,7 @@ def fetch_github(url: str) -> dict[str, Any]:
 
 def _fetch_github_user(username: str, headers: dict) -> dict[str, Any]:
     import requests
+
     user_r = requests.get(f"https://api.github.com/users/{username}", headers=headers, timeout=10)
     user_r.raise_for_status()
     user = user_r.json()
@@ -62,65 +163,149 @@ def _fetch_github_user(username: str, headers: dict) -> dict[str, Any]:
     repos_r = requests.get(
         f"https://api.github.com/users/{username}/repos",
         headers=headers,
-        params={"per_page": 10, "sort": "pushed"},
+        params={"per_page": 100, "sort": "pushed", "type": "owner"},
         timeout=10,
     )
     repos = repos_r.json() if repos_r.ok else []
+    if isinstance(repos, list):
+        repos.sort(key=lambda r: r.get("stargazers_count", 0) if isinstance(r, dict) else 0, reverse=True)
 
-    meta = {
-        "username": user.get("login"),
-        "name": user.get("name"),
-        "bio": user.get("bio"),
-        "company": user.get("company"),
-        "location": user.get("location"),
-        "public_repos": user.get("public_repos", 0),
-        "followers": user.get("followers", 0),
-        "top_repos": [
-            {"name": r["name"], "stars": r.get("stargazers_count", 0),
-             "language": r.get("language"), "description": r.get("description", "")}
-            for r in repos[:10] if isinstance(r, dict)
-        ],
-    }
+    # Profile README (special username/username repo)
+    profile_readme = ""
+    try:
+        readme_r = requests.get(
+            f"https://api.github.com/repos/{username}/{username}/readme",
+            headers=headers, timeout=10,
+        )
+        if readme_r.ok:
+            import base64
+            readme_data = readme_r.json()
+            content_b64 = readme_data.get("content", "")
+            profile_readme = base64.b64decode(content_b64).decode("utf-8", errors="replace")[:6000]
+            log.info("github    fetched profile README for @%s (%d chars)", username, len(profile_readme))
+    except Exception as e:
+        log.debug("github    profile README fetch failed for @%s: %s", username, e)
 
-    languages = set()
+    # Social accounts (LinkedIn, Twitter, etc.)
+    social_accounts: list[dict[str, str]] = []
+    try:
+        social_r = requests.get(
+            f"https://api.github.com/users/{username}/social_accounts",
+            headers=headers, timeout=10,
+        )
+        if social_r.ok:
+            social_accounts = social_r.json() or []
+            log.info("github    fetched %d social accounts for @%s", len(social_accounts), username)
+    except Exception as e:
+        log.debug("github    social accounts fetch failed for @%s: %s", username, e)
+
+    # Organizations
+    orgs: list[dict[str, Any]] = []
+    try:
+        orgs_r = requests.get(
+            f"https://api.github.com/users/{username}/orgs",
+            headers=headers, timeout=10,
+        )
+        if orgs_r.ok:
+            orgs = orgs_r.json() or []
+            log.info("github    fetched %d orgs for @%s", len(orgs), username)
+    except Exception as e:
+        log.debug("github    orgs fetch failed for @%s: %s", username, e)
+
+    top_repos = [
+        {"name": r["name"], "stars": r.get("stargazers_count", 0),
+         "language": r.get("language"), "description": r.get("description", ""),
+         "url": r.get("html_url", "")}
+        for r in repos[:15] if isinstance(r, dict)
+    ]
+
+    languages: set[str] = set()
     total_stars = 0
     for r in repos:
         if isinstance(r, dict):
             if r.get("language"):
                 languages.add(r["language"])
             total_stars += r.get("stargazers_count", 0)
-    meta["total_stars"] = total_stars
-    meta["languages"] = sorted(languages)
+
+    meta: dict[str, Any] = {
+        "username": user.get("login"),
+        "name": user.get("name"),
+        "bio": user.get("bio"),
+        "company": user.get("company"),
+        "location": user.get("location"),
+        "blog": user.get("blog"),
+        "email": user.get("email"),
+        "twitter_username": user.get("twitter_username"),
+        "hireable": user.get("hireable"),
+        "public_repos": user.get("public_repos", 0),
+        "followers": user.get("followers", 0),
+        "total_stars": total_stars,
+        "languages": sorted(languages),
+        "top_repos": top_repos,
+        "social_accounts": [
+            {"provider": s.get("provider", ""), "url": s.get("url", "")}
+            for s in social_accounts if isinstance(s, dict)
+        ],
+        "organizations": [
+            {"login": o.get("login", ""), "description": o.get("description", "")}
+            for o in orgs[:10] if isinstance(o, dict)
+        ],
+    }
+
+    blog_url = (user.get("blog") or "").strip()
+    twitter = (user.get("twitter_username") or "").strip()
+    email = (user.get("email") or "").strip()
 
     lines = [
         f"GitHub: {user.get('name', username)} (@{username})",
         f"Bio: {user.get('bio', 'N/A')}",
         f"Company: {user.get('company', 'N/A')}",
         f"Location: {user.get('location', 'N/A')}",
+        f"Website: {blog_url or 'N/A'}",
+        f"Email: {email or 'N/A'}",
+        f"Twitter: @{twitter}" if twitter else "Twitter: N/A",
+        f"Hireable: {user.get('hireable', 'N/A')}",
         f"Public repos: {user.get('public_repos', 0)} | Followers: {user.get('followers', 0)} | Stars: {total_stars}",
-        f"Languages: {', '.join(meta['languages']) or 'N/A'}",
-        "",
-        "Top repositories:",
+        f"Languages: {', '.join(sorted(languages)) or 'N/A'}",
     ]
-    for r in meta["top_repos"]:
+
+    if orgs:
+        lines.append(f"Organizations: {', '.join(o.get('login', '') for o in orgs[:10])}")
+
+    if social_accounts:
+        lines.append("Social accounts:")
+        for s in social_accounts:
+            if isinstance(s, dict):
+                lines.append(f"  - {s.get('provider', '?')}: {s.get('url', '')}")
+
+    lines.append("")
+    lines.append("Top repositories (by stars):")
+    for r in top_repos:
         lines.append(f"  - {r['name']} ({r['language'] or '?'}, {r['stars']}★): {r['description'][:120]}")
+
+    if profile_readme:
+        lines.append("")
+        lines.append("--- Profile README ---")
+        lines.append(profile_readme)
 
     return {"content_text": "\n".join(lines), "content_type": "text", "metadata": meta}
 
 
 def _fetch_github_repo(owner: str, repo: str, headers: dict) -> dict[str, Any]:
     import requests
+
     r = requests.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=10)
     r.raise_for_status()
     data = r.json()
 
-    meta = {
+    meta: dict[str, Any] = {
         "full_name": data.get("full_name"),
         "stars": data.get("stargazers_count", 0),
         "forks": data.get("forks_count", 0),
         "language": data.get("language"),
         "description": data.get("description", ""),
         "topics": data.get("topics", []),
+        "open_issues": data.get("open_issues_count", 0),
     }
 
     lines = [
@@ -130,16 +315,47 @@ def _fetch_github_repo(owner: str, repo: str, headers: dict) -> dict[str, Any]:
         f"Topics: {', '.join(meta['topics']) or 'N/A'}",
     ]
 
+    # Repo languages breakdown
+    try:
+        langs_r = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/languages",
+            headers=headers, timeout=10,
+        )
+        if langs_r.ok:
+            lang_data = langs_r.json() or {}
+            if lang_data:
+                meta["languages"] = lang_data
+                lines.append(f"Languages: {', '.join(lang_data.keys())}")
+    except Exception:
+        pass
+
     readme_r = requests.get(f"https://api.github.com/repos/{owner}/{repo}/readme", headers=headers, timeout=10)
     if readme_r.ok:
         import base64
         readme_data = readme_r.json()
         content_b64 = readme_data.get("content", "")
         try:
-            readme_text = base64.b64decode(content_b64).decode("utf-8", errors="replace")[:4000]
+            readme_text = base64.b64decode(content_b64).decode("utf-8", errors="replace")[:6000]
             lines.append(f"\nREADME (excerpt):\n{readme_text}")
         except Exception:
             pass
+
+    # Fetch owner profile and merge — this gives us the candidate's full
+    # GitHub presence even when only a repo URL was provided.
+    try:
+        owner_result = _fetch_github_user(owner, headers)
+        owner_meta = owner_result.get("metadata", {})
+        meta["owner_profile"] = {
+            k: owner_meta.get(k)
+            for k in ("username", "name", "bio", "company", "location",
+                       "blog", "email", "twitter_username", "hireable",
+                       "public_repos", "followers", "total_stars", "languages",
+                       "top_repos", "social_accounts", "organizations")
+        }
+        lines.append(f"\n--- Owner profile ---\n{owner_result.get('content_text', '')}")
+        log.info("github    merged owner profile @%s into repo %s/%s", owner, owner, repo)
+    except Exception as e:
+        log.debug("github    owner profile fetch failed for %s: %s", owner, e)
 
     return {"content_text": "\n".join(lines), "content_type": "text", "metadata": meta}
 
@@ -246,8 +462,8 @@ def fetch_paper(url: str) -> dict[str, Any]:
             log.info("paper     got HTML instead of PDF, falling back to plain HTTP")
             return _fallback_plain(url)
         else:
-            log.info("paper     got non-PDF content (%s), using raw text", content_type)
-            return {"content_text": resp.text[:8000], "content_type": "text", "metadata": {"source": "paper_direct"}}
+            log.info("paper     got non-PDF content (%s), using raw text (header only)", content_type)
+            return {"content_text": resp.text[:3000], "content_type": "text", "metadata": {"source": "paper_direct"}}
 
     except Exception as e:
         log.error("paper     failed url=%s error=%s", url, e)
@@ -255,17 +471,23 @@ def fetch_paper(url: str) -> dict[str, Any]:
 
 
 def _extract_pdf_text(pdf_bytes: bytes, url: str) -> dict[str, Any]:
-    """Extract text from PDF bytes using pdfplumber."""
+    """Extract header section (authors, affiliations, abstract) from a PDF.
+
+    Only reads the first 3 pages and caps at 3000 chars — the rest of a
+    research paper (methodology, results, references) isn't useful for
+    candidate evaluation.
+    """
     import io
     try:
         import pdfplumber
         pages_text = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages[:20]):
+            for page in pdf.pages[:3]:
                 text = page.extract_text() or ""
                 if text.strip():
                     pages_text.append(text)
-        full = "\n\n".join(pages_text)[:12000]
+        full = "\n\n".join(pages_text)[:3000]
+        log.info("paper     extracted %d pages, %d chars (header only)", len(pages_text), len(full))
         return {
             "content_text": full,
             "content_type": "text",

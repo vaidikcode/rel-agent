@@ -33,9 +33,11 @@ create table if not exists public.bucket_candidates (
   skills jsonb not null default '[]',
   relevance_percentage int,
   status text not null default 'discovered',
+  evaluation_details jsonb,
   created_at timestamptz not null default now()
 );
 create index if not exists bucket_candidates_bucket on public.bucket_candidates(bucket_id);
+-- Migration: if table already exists, run: alter table public.bucket_candidates add column if not exists evaluation_details jsonb;
 
 -- 4. Links associated with a candidate
 create table if not exists public.candidate_links (

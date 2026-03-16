@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import run_candidate_evaluation
+from agent import run_candidate_evaluation, extract_candidate_details
 from discovery_agent import run_discovery
 from link_scraper import scrape_candidate_links, fetch_and_store_links
 from supabase_client import (
@@ -345,13 +345,20 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
         v = verdicts.get(rid, {"passed": False, "reason": "Not evaluated"})
         eval_rows.append({"requirement_id": rid, "passed": v["passed"], "reason": v.get("reason", "")})
 
-    log.info("evaluate  step 3/3 — saving results to DB...")
+    log.info("evaluate  step 3/3 — extracting structured details...")
+    evaluation_details: dict[str, Any] | None = None
+    try:
+        evaluation_details = extract_candidate_details(full_text, verdicts, requirements)
+    except Exception as e:
+        log.warning("evaluate  details extraction failed (continuing): %s", e)
+
+    log.info("evaluate  step 4/4 — saving results to DB...")
     insert_candidate_evaluations(candidate_id, eval_rows)
 
     total_weight = sum(r.get("weight", 1) for r in requirements) or 1
     earned = sum(r.get("weight", 1) for r in requirements if verdicts.get(r["id"], {}).get("passed"))
     relevance = round((earned / total_weight) * 100)
-    update_candidate_evaluation_status(candidate_id, relevance)
+    update_candidate_evaluation_status(candidate_id, relevance, evaluation_details=evaluation_details)
 
     passed = sum(1 for e in eval_rows if e["passed"])
     log.info("evaluate  done — relevance=%d%% (%d/%d passed) for candidate=%s", relevance, passed, len(eval_rows), candidate_id)
@@ -360,4 +367,5 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
         "candidate_id": candidate_id,
         "relevance_percentage": relevance,
         "evaluations": eval_rows,
+        "evaluation_details": evaluation_details,
     }

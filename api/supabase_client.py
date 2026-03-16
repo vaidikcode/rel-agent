@@ -286,12 +286,19 @@ def insert_candidate_evaluations(candidate_id: str, results: list[dict]) -> None
         sb.table("candidate_evaluations").insert(rows).execute()
 
 
-def update_candidate_evaluation_status(candidate_id: str, relevance_percentage: int) -> None:
+def update_candidate_evaluation_status(
+    candidate_id: str,
+    relevance_percentage: int,
+    evaluation_details: dict[str, Any] | None = None,
+) -> None:
     sb = get_supabase()
-    sb.table("bucket_candidates").update({
+    payload: dict[str, Any] = {
         "status": "evaluated",
         "relevance_percentage": relevance_percentage,
-    }).eq("id", candidate_id).execute()
+    }
+    if evaluation_details is not None:
+        payload["evaluation_details"] = evaluation_details
+    sb.table("bucket_candidates").update(payload).eq("id", candidate_id).execute()
 
 
 def get_candidate_evaluations(candidate_id: str) -> list[dict[str, Any]]:

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
-import { Plus, Briefcase, Loader2 } from "lucide-react"
+import { Plus, Briefcase} from "lucide-react"
 
 const API = "/api"
 

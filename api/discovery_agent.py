@@ -14,7 +14,7 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from agent import _get_llm, _message_content_to_str
+from agent import llm_invoke, _message_content_to_str
 
 log = logging.getLogger("discovery")
 
@@ -52,31 +52,60 @@ def _serper_search(query: str, num_results: int = 10) -> list[dict]:
     resp.raise_for_status()
     data = resp.json()
     organic = data.get("organic") or []
-    log.info("search    Serper returned %d results for query", len(organic))
+    log.info("search    Serper q='%s' → %d results", query, len(organic))
     return organic
 
 
-def _build_search_queries(job_description: str) -> list[str]:
-    llm = _get_llm()
-    prompt = f"""You are a technical recruiter. Generate exactly 3 Google search queries to find
-candidate profiles (people, not job listings) matching this role.
-Target professional sites: LinkedIn, GitHub, StackOverflow, personal blogs, portfolios.
-Each query should cover a different angle.
+def _extract_job_summary_and_queries(job_description: str) -> tuple[dict[str, Any], list[str]]:
+    """Single LLM call: extract job summary (role, skills, domain) and 5-6 search queries."""
+    prompt = f"""Use this job description to do two things in one response.
 
 Job description:
----
-{job_description[:5000]}
----
+{job_description[:2500]}
 
-Return exactly 3 lines, one query per line, nothing else."""
+Return a single JSON object with exactly these keys (no other text, no markdown):
+1. "role_title": exact job title or role (e.g. "Senior ML Engineer", "Research Scientist")
+2. "key_skills": array of 3-5 concrete skills/tech (e.g. ["Python", "PyTorch", "NLP"])
+3. "domain": one phrase for industry/focus (e.g. "machine learning", "backend infrastructure")
+4. "search_queries": array of 5-6 Google search query strings to find people matching this role.
 
-    msg = llm.invoke([
-        SystemMessage(content="You generate search queries for recruiting. Return only queries, one per line."),
+Rules for search_queries:
+- Each query must use site: (e.g. site:linkedin.com/in, site:github.com, site:arxiv.org).
+- Include role or 1-2 key skills per query. No boolean (OR/AND). Under 10-12 words each.
+- Cover: 1-2 LinkedIn, 1-2 GitHub, 1 arxiv/scholar, 1 general. Vary phrasing.
+
+Example search_queries entry: "site:linkedin.com/in Senior ML Engineer Python"
+Return only valid JSON."""
+
+    msg = llm_invoke([
+        SystemMessage(content="You extract structured data. Return only a JSON object, no markdown."),
         HumanMessage(content=prompt),
     ])
-    content = _message_content_to_str(getattr(msg, "content", str(msg)))
-    queries = [q.strip().strip('"') for q in content.strip().split("\n") if q.strip()]
-    return queries[:3] or [f"candidates for {job_description[:80]}"]
+    content = _message_content_to_str(getattr(msg, "content", str(msg))).strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        data = json.loads(content)
+        role = (data.get("role_title") or "").strip() or None
+        skills = data.get("key_skills")
+        if isinstance(skills, str):
+            skills = [s.strip() for s in skills.split(",") if s.strip()]
+        if not isinstance(skills, list):
+            skills = []
+        skills = [str(s).strip() for s in skills[:6] if s]
+        domain = (data.get("domain") or "").strip() or None
+        summary = {"role_title": role, "key_skills": skills, "domain": domain}
+        raw_queries = data.get("search_queries")
+        if isinstance(raw_queries, list):
+            queries = [str(q).strip().strip('"') for q in raw_queries if q][:6]
+        else:
+            queries = []
+        if not queries:
+            queries = [f"site:linkedin.com/in {job_description[:60]}"]
+        return summary, queries
+    except (json.JSONDecodeError, TypeError):
+        summary = {"role_title": None, "key_skills": [], "domain": None}
+        return summary, [f"site:linkedin.com/in {job_description[:80]}"]
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +113,12 @@ Return exactly 3 lines, one query per line, nothing else."""
 # ---------------------------------------------------------------------------
 
 def search_node(state: DiscoveryState) -> dict:
-    queries = _build_search_queries(state["job_description"])
+    job_description = state["job_description"] or ""
+    job_summary, queries = _extract_job_summary_and_queries(job_description)
+    log.info("search    summary role=%r skills=%s domain=%r", job_summary.get("role_title"), job_summary.get("key_skills"), job_summary.get("domain"))
     log.info("search    generated %d queries", len(queries))
     for i, q in enumerate(queries, 1):
-        log.info("search    query %d: %s", i, q[:100])
+        log.info("search    query %d: %s", i, q)
     all_results: list[dict] = []
     seen_urls: set[str] = set()
     for q in queries:
@@ -101,7 +132,7 @@ def search_node(state: DiscoveryState) -> dict:
         except Exception as e:
             log.error("search    Serper failed for query '%s': %s", q[:60], e)
     log.info("search    %d unique results from %d queries", len(all_results), len(queries))
-    return {"search_results": all_results[:25]}
+    return {"search_results": all_results[:45]}
 
 
 def extract_node(state: DiscoveryState) -> dict:
@@ -111,35 +142,24 @@ def extract_node(state: DiscoveryState) -> dict:
 
     snippets = "\n\n".join(
         f"Title: {r.get('title', '')}\nURL: {r.get('link', '')}\nSnippet: {r.get('snippet', '')}"
-        for r in results[:25]
+        for r in results[:45]
     )
 
-    llm = _get_llm()
-    prompt = f"""Extract candidate profiles from these search results for a recruiting tool.
+    prompt = f"""Extract people from these search results.
 
-Job context:
----
-{state['job_description'][:2500]}
----
+Job: {state['job_description'][:1500]}
 
-Search results:
----
+Results:
 {snippets[:12000]}
----
 
-For each result that could represent a real person (developer profile, portfolio, blog, GitHub, LinkedIn, etc.), extract:
-- name: full name if visible, otherwise a short label from the title
-- headline: their professional title/role
-- location: if mentioned, else "Unknown"
-- skills: array of relevant skills (strings)
-- summary: one sentence on why they might be relevant
-- links: array of objects with "url" and "label". Include multiple links per candidate when available (e.g. LinkedIn, GitHub, portfolio, blog, Stack Overflow). For each person, add every relevant URL you can identify from the results (same person may appear in multiple results with different links).
+For each real person found, return JSON with:
+- name, headline, location ("Unknown" if missing), skills (array), summary (1 sentence)
+- links: array of {{"url","label"}}. Include every URL for the person (LinkedIn, GitHub, arxiv papers, portfolio, scholar page, etc.). For papers, use the first author name and include the paper URL.
 
-Include any result that seems to belong to a real person or their work.
-Return a JSON array of objects. Return ONLY the JSON array, no markdown fences."""
+Merge the same person across results. Return ONLY a JSON array."""
 
-    msg = llm.invoke([
-        SystemMessage(content="Extract structured candidate data from search results. Return only valid JSON array."),
+    msg = llm_invoke([
+        SystemMessage(content="Extract candidate profiles as JSON array. Include researchers from papers."),
         HumanMessage(content=prompt),
     ])
     content = _message_content_to_str(getattr(msg, "content", str(msg))).strip()
