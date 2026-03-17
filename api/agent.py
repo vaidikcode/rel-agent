@@ -1,9 +1,12 @@
 """
-LangGraph evaluation agent.
-Evaluates a candidate against bucket requirements using scraped link content.
+Shared LLM infrastructure.
 
 Gemini key pool: loads GOOGLE_API_KEY_1 … _N from env and rotates
 automatically when a key hits 429 / RESOURCE_EXHAUSTED.
+
+Public surface used by discovery_agent and eval_agent:
+  - llm_invoke, _message_content_to_str, RequirementVerdict
+  - _current_key, _load_keys, _KEY_POOL, GEMINI_MODEL, _get_llm
 """
 import logging
 import os
@@ -103,6 +106,10 @@ def llm_invoke(messages: list, *, max_retries: int | None = None) -> Any:
     raise last_err or RuntimeError("All Gemini API keys exhausted")
 
 
+# ---------------------------------------------------------------------------
+# Shared types and parsing helpers
+# ---------------------------------------------------------------------------
+
 class RequirementVerdict(TypedDict):
     passed: bool
     reason: str
@@ -118,31 +125,10 @@ def _message_content_to_str(content: str | list) -> str:
     return str(content)
 
 
-def _eval_all_prompt(candidate_text: str, requirements: list[dict[str, Any]]) -> str:
-    req_block = "\n\n".join(
-        f'- id: "{r["id"]}"\n  label: {r.get("label", r["id"])}\n  what to check: {r.get("prompt", "")}'
-        for r in requirements
-    )
-    return f"""Evaluate the candidate against ALL of the following requirements in one go.
-
-Candidate information (scraped from their online profiles):
----
-{candidate_text[:14000]}
----
-
-Requirements (use the exact "id" string in your response):
-{req_block}
-
-Return a single JSON array with one object per requirement. Each object must have:
-- "requirement_id": the exact id string from the list above
-- "passed": true or false
-- "reason": one short sentence explaining why
-
-Example: [{{"requirement_id": "...", "passed": true, "reason": "..."}}, ...]
-Return only the JSON array, no other text."""
-
-
 def _parse_batched_verdicts(response_text: str, requirement_ids: list[str]) -> dict[str, RequirementVerdict]:
+    """Parse a JSON array of {requirement_id, passed, reason} from LLM output."""
+    import json as _json
+
     if not isinstance(response_text, str):
         response_text = _message_content_to_str(response_text)
     text = response_text.strip()
@@ -152,7 +138,6 @@ def _parse_batched_verdicts(response_text: str, requirement_ids: list[str]) -> d
     for rid in requirement_ids:
         results[rid] = {"passed": False, "reason": "Not evaluated"}
     try:
-        import json as _json
         arr = _json.loads(text)
         if not isinstance(arr, list):
             return results
@@ -170,85 +155,3 @@ def _parse_batched_verdicts(response_text: str, requirement_ids: list[str]) -> d
     except Exception:
         pass
     return results
-
-
-def run_candidate_evaluation(candidate_text: str, requirements: list[dict[str, Any]]) -> dict[str, RequirementVerdict]:
-    """Evaluate a candidate's scraped content against all requirements in one LLM call.
-    Returns { requirement_id: { passed, reason } }."""
-    if not requirements:
-        raise ValueError("At least one requirement is needed for evaluation")
-    prompt = _eval_all_prompt(candidate_text, requirements)
-    msg = llm_invoke([
-        SystemMessage(content="You are a strict but fair candidate evaluator. Output only the JSON array."),
-        HumanMessage(content=prompt),
-    ])
-    content = msg.content if hasattr(msg, "content") else str(msg)
-    return _parse_batched_verdicts(_message_content_to_str(content), [r["id"] for r in requirements])
-
-
-# ---------------------------------------------------------------------------
-# Structured candidate details extraction (post-evaluation)
-# ---------------------------------------------------------------------------
-
-def extract_candidate_details(
-    candidate_text: str,
-    verdicts: dict[str, RequirementVerdict],
-    requirements: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Extract structured candidate details from scraped content and evaluation verdicts.
-    Returns a dict suitable for evaluation_details JSON: experience_summary, education,
-    key_skills_evidence, strengths, concerns, fit_summary."""
-    verdict_summary = "\n".join(
-        f"- {next((r.get('label', r['id']) for r in requirements if r['id'] == rid), rid)}: {'Pass' if v['passed'] else 'Fail'} — {v.get('reason', '')}"
-        for rid, v in verdicts.items()
-    )
-    prompt = f"""Based on the candidate information and evaluation results below, extract structured details.
-
-Candidate information (from their profiles):
----
-{candidate_text[:14000]}
----
-
-Evaluation results:
-{verdict_summary}
-
-Respond with a single JSON object (no markdown, no code fence) with exactly these keys:
-- experience_summary: string (2–4 sentences on work history and role relevance)
-- education: string (degrees, institutions if mentioned; "Not mentioned" if absent)
-- key_skills_evidence: string (concrete evidence from profiles for top skills; brief)
-- strengths: array of strings (3–6 bullet points: what makes them strong for the role)
-- concerns: array of strings (0–4 bullet points: gaps or risks; empty array if none)
-- fit_summary: string (2–3 sentences overall fit and recommendation)"""
-
-    msg = llm_invoke([
-        SystemMessage(content="You are an analyst. Output only valid JSON with the requested keys. No other text."),
-        HumanMessage(content=prompt),
-    ])
-    content = _message_content_to_str(msg.content if hasattr(msg, "content") else str(msg))
-    # Strip markdown code block if present
-    raw = content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
-    if raw.endswith("```"):
-        raw = raw.rsplit("```", 1)[0].strip()
-    try:
-        import json
-        out = json.loads(raw)
-    except Exception:
-        out = {}
-    # Normalize types
-    if not isinstance(out.get("strengths"), list):
-        out["strengths"] = [s.strip() for s in str(out.get("strengths", "")).split("\n") if s.strip()][:8]
-    if not isinstance(out.get("concerns"), list):
-        out["concerns"] = [s.strip() for s in str(out.get("concerns", "")).split("\n") if s.strip()][:6]
-    for key in ("experience_summary", "education", "key_skills_evidence", "fit_summary"):
-        if not isinstance(out.get(key), str):
-            out[key] = str(out.get(key, "") or "")
-    return {
-        "experience_summary": (out.get("experience_summary") or "").strip() or None,
-        "education": (out.get("education") or "").strip() or None,
-        "key_skills_evidence": (out.get("key_skills_evidence") or "").strip() or None,
-        "strengths": [s for s in (out.get("strengths") or []) if s][:8],
-        "concerns": [s for s in (out.get("concerns") or []) if s][:6],
-        "fit_summary": (out.get("fit_summary") or "").strip() or None,
-    }

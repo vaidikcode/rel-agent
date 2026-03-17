@@ -271,6 +271,37 @@ def list_candidate_links(candidate_id: str) -> list[dict[str, Any]]:
     return list(r.data or [])
 
 
+def ensure_candidate_link(
+    candidate_id: str,
+    url: str,
+    label: str = "",
+    link_type: str = "web",
+    source: str = "eval_agent",
+) -> dict[str, Any]:
+    """Return existing candidate_link row for this URL, or insert a new one."""
+    sb = get_supabase()
+    existing = (
+        sb.table("candidate_links")
+        .select("*")
+        .eq("candidate_id", candidate_id)
+        .eq("url", url)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return existing.data[0]
+    r = sb.table("candidate_links").insert({
+        "candidate_id": candidate_id,
+        "url": url,
+        "label": label or url,
+        "link_type": link_type,
+        "source": source,
+    }).execute()
+    if not r.data:
+        raise RuntimeError(f"Failed to insert candidate link: {url}")
+    return r.data[0]
+
+
 # ---------------------------------------------------------------------------
 # Candidate Evaluations
 # ---------------------------------------------------------------------------

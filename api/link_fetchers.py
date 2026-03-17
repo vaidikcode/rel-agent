@@ -6,6 +6,10 @@ Each fetcher returns a dict with:
   content_type  – "markdown" | "json" | "text"
   metadata      – dict of structured extras (e.g. GitHub stars)
   error         – optional error string if something went wrong
+
+URL discovery is handled by the LLM in the ReAct eval agent — it reads
+fetched content and decides which new URLs to follow. No regex extraction
+needed here.
 """
 from __future__ import annotations
 
@@ -14,109 +18,9 @@ import logging
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse, urljoin, urldefrag
+from urllib.parse import urlparse
 
 log = logging.getLogger("pipeline.fetch")
-
-# ---------------------------------------------------------------------------
-# URL extraction helpers
-# ---------------------------------------------------------------------------
-
-_GITHUB_URL_RE = re.compile(
-    r"https?://(?:www\.)?github\.com/([a-zA-Z0-9_.-]+)(?:/([a-zA-Z0-9_.-]+))?(?:/[^\s)\]]*)?",
-    re.IGNORECASE,
-)
-
-_ANY_URL_RE = re.compile(r"https?://[^\s\"'<>\)\]\}]+", re.IGNORECASE)
-
-_ALLOWED_DISCOVERY_HOSTS = {
-    "github.com", "linkedin.com", "arxiv.org", "doi.org",
-    "scholar.google.com", "semanticscholar.org",
-    "medium.com", "dev.to", "substack.com",
-}
-
-_NOISE_PATH_TOKENS = {
-    "login", "logout", "signin", "signup", "share", "intent",
-    "auth", "oauth", "settings", "notifications", "help", "support",
-    "terms", "privacy", "policy", "status", "jobs",
-}
-
-
-def extract_github_urls_from_text(text: str, max_urls: int = 10) -> list[str]:
-    """Extract unique, normalized github.com URLs from page content."""
-    if not text:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for m in _GITHUB_URL_RE.finditer(text):
-        owner = (m.group(1) or "").strip()
-        repo = (m.group(2) or "").strip()
-        if not owner or owner.lower() in ("settings", "notifications", "orgs", "explore", "topics"):
-            continue
-        if repo and repo.lower() not in ("settings", "notifications"):
-            url = f"https://github.com/{owner}/{repo}"
-        else:
-            url = f"https://github.com/{owner}"
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-            if len(out) >= max_urls:
-                break
-    return out
-
-
-def extract_discoverable_urls(
-    text: str,
-    source_url: str | None = None,
-    max_urls: int = 15,
-) -> list[str]:
-    """Extract URLs worth fetching from page content.
-
-    Keeps: allowed-domain URLs + same-origin URLs (for portfolio subpages).
-    Skips: login/auth noise, fragments, duplicates.
-    """
-    if not text:
-        return []
-
-    source_host: str | None = None
-    if source_url:
-        try:
-            source_host = (urlparse(source_url).hostname or "").lower().removeprefix("www.")
-        except Exception:
-            pass
-
-    seen: set[str] = set()
-    out: list[str] = []
-
-    for m in _ANY_URL_RE.finditer(text):
-        raw = m.group(0).rstrip(".,;:!?)'\"")
-        defragged, _ = urldefrag(raw)
-        if not defragged or defragged in seen:
-            continue
-
-        try:
-            parsed = urlparse(defragged)
-            host = (parsed.hostname or "").lower().removeprefix("www.")
-            path = parsed.path.lower()
-        except Exception:
-            continue
-
-        path_parts = {p for p in path.split("/") if p}
-        if path_parts & _NOISE_PATH_TOKENS:
-            continue
-
-        is_allowed = any(host.endswith(ah) for ah in _ALLOWED_DISCOVERY_HOSTS)
-        is_same_origin = source_host and host == source_host
-
-        if not is_allowed and not is_same_origin:
-            continue
-
-        seen.add(defragged)
-        out.append(defragged)
-        if len(out) >= max_urls:
-            break
-
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +287,8 @@ def fetch_cloudflare_crawl(url: str) -> dict[str, Any]:
     try:
         start_r = requests.post(base, headers=headers, json={
             "url": url,
-            "scrapeOptions": {"formats": ["markdown"]},
-            "maxPages": 3,
+            "formats": ["markdown"],
+            "limit": 3,
         }, timeout=30)
         start_r.raise_for_status()
         job = start_r.json()
@@ -426,44 +330,70 @@ def _fallback_plain(url: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def fetch_paper(url: str) -> dict[str, Any]:
-    """Fetch a PDF or research paper URL and extract text."""
+    """Fetch a research paper URL — prefers the HTML abstract page for arxiv
+    (rich with author links, code links) and falls back to PDF extraction."""
     import requests
 
     log.info("paper     fetching url=%s", url)
     try:
         parsed = urlparse(url)
         path = parsed.path.lower()
+        hostname = parsed.hostname or ""
 
-        if "arxiv.org" in (parsed.hostname or "") and "/abs/" in path:
-            pdf_url = url.replace("/abs/", "/pdf/") + ".pdf"
-            log.debug("paper     rewrote arxiv abstract → pdf: %s", pdf_url)
-        elif "doi.org" in (parsed.hostname or ""):
-            pdf_url = url
-        else:
-            pdf_url = url
+        # ── arxiv: fetch the HTML abstract page (has author links, code, etc.) ──
+        if "arxiv.org" in hostname and ("/abs/" in path or "/pdf/" in path):
+            abs_url = url.replace("/pdf/", "/abs/").split(".pdf")[0]
+            log.info("paper     fetching arxiv HTML abstract: %s", abs_url)
+            try:
+                html_resp = requests.get(
+                    abs_url, timeout=20,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; MireloBot/1.0)"},
+                )
+                html_resp.raise_for_status()
+                from link_scraper import _extract_text_from_html
+                html_text = _extract_text_from_html(html_resp.text)[:4000]
+                log.info("paper     arxiv HTML extracted %d chars", len(html_text))
+                return {
+                    "content_text": html_text,
+                    "content_type": "text",
+                    "metadata": {"source": "arxiv_html", "url": abs_url},
+                }
+            except Exception as html_err:
+                log.warning("paper     arxiv HTML failed (%s), falling back to PDF", html_err)
 
-        if not path.endswith(".pdf") and "arxiv" not in (parsed.hostname or ""):
-            log.info("paper     not a PDF URL, falling back to plain HTTP for %s", url)
+            pdf_url = abs_url.replace("/abs/", "/pdf/") + ".pdf"
+            resp = requests.get(
+                pdf_url, timeout=30,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; MireloBot/1.0)"},
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            if "pdf" in resp.headers.get("content-type", ""):
+                log.info("paper     extracting text from PDF (%d bytes)", len(resp.content))
+                return _extract_pdf_text(resp.content, url)
+            return _fallback_plain(abs_url)
+
+        # ── DOI or other paper URLs ──
+        if "doi.org" in hostname:
             return _fallback_plain(url)
 
-        resp = requests.get(
-            pdf_url,
-            timeout=30,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MireloBot/1.0)"},
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-
-        if "pdf" in content_type:
-            log.info("paper     extracting text from PDF (%d bytes)", len(resp.content))
-            return _extract_pdf_text(resp.content, url)
-        elif "html" in content_type:
-            log.info("paper     got HTML instead of PDF, falling back to plain HTTP")
-            return _fallback_plain(url)
-        else:
-            log.info("paper     got non-PDF content (%s), using raw text (header only)", content_type)
+        if path.endswith(".pdf"):
+            resp = requests.get(
+                url, timeout=30,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; MireloBot/1.0)"},
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "pdf" in ct:
+                log.info("paper     extracting text from PDF (%d bytes)", len(resp.content))
+                return _extract_pdf_text(resp.content, url)
+            elif "html" in ct:
+                return _fallback_plain(url)
             return {"content_text": resp.text[:3000], "content_type": "text", "metadata": {"source": "paper_direct"}}
+
+        log.info("paper     not a PDF URL, falling back to plain HTTP for %s", url)
+        return _fallback_plain(url)
 
     except Exception as e:
         log.error("paper     failed url=%s error=%s", url, e)

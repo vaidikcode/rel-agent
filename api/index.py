@@ -26,15 +26,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import run_candidate_evaluation, extract_candidate_details
 from discovery_agent import run_discovery
-from link_scraper import scrape_candidate_links, fetch_and_store_links
+from eval_agent import run_eval_agent
 from supabase_client import (
     list_buckets, get_bucket, create_bucket, update_bucket, delete_bucket,
     list_bucket_requirements, create_bucket_requirement, update_bucket_requirement, delete_bucket_requirement,
     list_bucket_candidates, get_bucket_candidate, insert_bucket_candidate, update_bucket_candidate, delete_bucket_candidate,
-    list_candidate_links,
+    list_candidate_links, ensure_candidate_link,
     insert_candidate_evaluations, update_candidate_evaluation_status, get_candidate_evaluations,
+    upsert_link_fetch,
 )
 
 app = FastAPI(title="Mirelo AI – Job Bucket API")
@@ -289,7 +289,7 @@ def api_discover(bucket_id: str) -> list[dict[str, Any]]:
 
 @app.post("/api/buckets/{bucket_id}/candidates/{candidate_id}/evaluate")
 def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
-    """Fetch candidate links with type-aware pipeline, evaluate against requirements."""
+    """ReAct agent: fetch links intelligently, evaluate against requirements."""
     log.info("evaluate  started for candidate=%s bucket=%s", candidate_id, bucket_id)
 
     try:
@@ -305,9 +305,11 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
     requirements = bucket.get("requirements", [])
     if not requirements:
         raise HTTPException(400, "Bucket has no requirements to evaluate against")
-    log.info("evaluate  candidate='%s', %d links, %d requirements", candidate.get("name", "?"), len(candidate.get("links", [])), len(requirements))
 
     links = candidate.get("links") or list_candidate_links(candidate_id)
+    log.info("evaluate  candidate='%s', %d links, %d requirements",
+             candidate.get("name", "?"), len(links), len(requirements))
+
     candidate_info = (
         f"Name: {candidate.get('name', '')}\n"
         f"Headline: {candidate.get('headline', '')}\n"
@@ -316,28 +318,46 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
         f"Summary: {candidate.get('summary', '')}\n"
     )
 
-    log.info("evaluate  step 1/3 — fetching %d links...", len(links))
-    fetched_text = ""
-    if links:
-        try:
-            fetched_text = fetch_and_store_links(
-                links,
-                candidate_name=candidate.get("name", ""),
-                max_links=10,
-            )
-        except Exception as e:
-            log.error("evaluate  link fetching failed: %s", e)
-            fetched_text = f"[Fetching failed: {e}]"
-
-    full_text = candidate_info + "\n\nFetched profile content:\n" + fetched_text if fetched_text else candidate_info
-    log.info("evaluate  step 2/3 — running LLM evaluation (%d chars of context)...", len(full_text))
-
+    log.info("evaluate  running ReAct agent (max 4 tool loops + eval)...")
     try:
-        verdicts = run_candidate_evaluation(full_text, requirements)
+        agent_result = run_eval_agent(
+            candidate_info=candidate_info,
+            candidate_name=candidate.get("name", ""),
+            candidate_id=candidate_id,
+            initial_links=links,
+            requirements=requirements,
+        )
     except Exception as e:
         if _is_quota_error(e):
             raise HTTPException(429, "API quota / rate limit reached. Wait a minute and retry.")
         raise HTTPException(500, f"Evaluation failed: {e}")
+
+    verdicts = agent_result.get("verdicts", {})
+    evaluation_details = agent_result.get("evaluation_details")
+    links_fetched = agent_result.get("links_fetched", [])
+
+    log.info("evaluate  agent done — %d links fetched, persisting...", len(links_fetched))
+    for lf in links_fetched:
+        url = lf.get("url", "")
+        if not url:
+            continue
+        try:
+            link_row = ensure_candidate_link(
+                candidate_id=candidate_id,
+                url=url,
+                label=url,
+                link_type=lf.get("link_type", "web"),
+                source="eval_agent",
+            )
+            upsert_link_fetch(
+                candidate_link_id=link_row["id"],
+                link_type=lf.get("link_type", "web"),
+                content_type=lf.get("content_type", "text"),
+                content_text=(lf.get("content_text") or "")[:50000],
+                metadata=lf.get("metadata", {}),
+            )
+        except Exception as e:
+            log.error("evaluate  failed to persist link %s: %s", url[:60], e)
 
     eval_rows = []
     for req in requirements:
@@ -345,14 +365,7 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
         v = verdicts.get(rid, {"passed": False, "reason": "Not evaluated"})
         eval_rows.append({"requirement_id": rid, "passed": v["passed"], "reason": v.get("reason", "")})
 
-    log.info("evaluate  step 3/3 — extracting structured details...")
-    evaluation_details: dict[str, Any] | None = None
-    try:
-        evaluation_details = extract_candidate_details(full_text, verdicts, requirements)
-    except Exception as e:
-        log.warning("evaluate  details extraction failed (continuing): %s", e)
-
-    log.info("evaluate  step 4/4 — saving results to DB...")
+    log.info("evaluate  saving evaluations to DB...")
     insert_candidate_evaluations(candidate_id, eval_rows)
 
     total_weight = sum(r.get("weight", 1) for r in requirements) or 1
@@ -361,7 +374,8 @@ def api_evaluate_candidate(bucket_id: str, candidate_id: str) -> dict[str, Any]:
     update_candidate_evaluation_status(candidate_id, relevance, evaluation_details=evaluation_details)
 
     passed = sum(1 for e in eval_rows if e["passed"])
-    log.info("evaluate  done — relevance=%d%% (%d/%d passed) for candidate=%s", relevance, passed, len(eval_rows), candidate_id)
+    log.info("evaluate  done — relevance=%d%% (%d/%d passed) for candidate=%s",
+             relevance, passed, len(eval_rows), candidate_id)
 
     return {
         "candidate_id": candidate_id,
